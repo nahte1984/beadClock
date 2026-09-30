@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#acacac">
+<title>beadClock</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=League+Gothic&display=swap">
+<style>
+/* Layout: one full-bleed stage; the dial sits dead centre and scales with the shorter screen edge.
+   Single deliberate look (the Figma frame), identical in light and dark. */
+:root {
+  --ground: #acacac;   /* Figma "body" */
+  --dial: #e1e1e1;     /* Figma "Obg" */
+  --face: "League Gothic", "Arial Narrow", Impact, sans-serif;
+  color-scheme: light;
+}
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--ground);
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+#stage {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+  outline: none;
+}
+#stage.dragging { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="stage" role="img" tabindex="0" aria-label="時鐘"></canvas>
+<script>
+(() => {
+  const TAU = Math.PI * 2;
+  const cv = document.getElementById('stage');
+  const ctx = cv.getContext('2d');
+  const rootCss = getComputedStyle(document.documentElement);
+  const GROUND = rootCss.getPropertyValue('--ground').trim() || '#acacac';
+  const DIAL = rootCss.getPropertyValue('--dial').trim() || '#e1e1e1';
+  const FACE = rootCss.getPropertyValue('--face').trim() || '"League Gothic", sans-serif';
+
+  // ---- Geometry lifted from the Figma frame (design px, origin = dial centre) ----
+  const R_RING = 148.5;   // centre of each numeral's text box
+  const R_DIAL = 185.5;   // Obg, 371 px across
+  const EXTENT = 400;     // design width that has to fit the shorter screen edge
+  const FONT_PX = 72;     // League Gothic Regular 72
+  const STROKE = 2;       // outside stroke on every numeral
+  const HAND = {
+    hour:   { len: 69.5,  tail: 13.5, w: 11, dot: 9 },  // "h" + 18 px "mm" dot
+    minute: { len: 108.5, tail: 17.5, w: 4,  dot: 7 },  // "m" + 14 px "hh" dot
+    second: { len: 151.2, tail: 23.8, w: 1,  dot: 3 },  // "s" + 6 px "ss" dot
+  };
+
+  // Fill / outline pairs. A pair never splits; which numeral wears it is reshuffled on every load.
+  const PAIRS = [
+    ['#ff001b', '#befa00'], ['#8785ff', '#ff9d00'], ['#b5f600', '#ff93f5'],
+    ['#ff00a1', '#31ffee'], ['#ffa100', '#28e08f'], ['#f5f500', '#999999'],
+    ['#00bb9f', '#d7ff55'], ['#5c9100', '#ffa0ff'], ['#ff79b0', '#8785ff'],
+    ['#00a7ff', '#af795e'], ['#5f3ab3', '#ff8fff'], ['#ad785d', '#fff721'],
+  ];
+
+  // ---- Physics (design px, seconds) ----
+  const G = 1700;          // full gravity along the screen
+  const FALL_DAMP = 1.6;   // air drag while falling
+  const K_HOME = 60;       // spring back to the hour positions
+  const HOME_DAMP = 11;
+  const OVERLAP = 0.6;     // 1 = beads just touch, lower = they slide further over each other
+  const STEP = 1 / 240, ITER = 6, MAX_FOLLOW = 0.08, MAX_FLING = 20;
+
+  // ---- Colour: blend in OKLab so 12 → 1 passes through clean midtones ----
+  const toLin = c => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+  const toSrgb = c => (c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055);
+  function hexToLab(hex) {
+    const n = parseInt(hex.slice(1), 16);
+    const r = toLin(((n >> 16) & 255) / 255), g = toLin(((n >> 8) & 255) / 255), b = toLin((n & 255) / 255);
+    const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+    const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+    const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+    return [
+      0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+      1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+      0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    ];
+  }
+  function mixLab(a, b, f) {
+    const L = a[0] + (b[0] - a[0]) * f, A = a[1] + (b[1] - a[1]) * f, B = a[2] + (b[2] - a[2]) * f;
+    const l = Math.pow(L + 0.3963377774 * A + 0.2158037573 * B, 3);
+    const m = Math.pow(L - 0.1055613458 * A - 0.0638541728 * B, 3);
+    const s = Math.pow(L - 0.0894841775 * A - 1.2914855480 * B, 3);
+    const rgb = [
+      4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+      -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+      -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+    ];
+    return 'rgb(' + rgb.map(v => Math.round(255 * Math.min(1, Math.max(0, toSrgb(Math.max(0, v)))))).join(',') + ')';
+  }
+
+  // ---- Beads: index 0 is "12", 1..11 are "1".."11"; clockwise order never changes ----
+  const deal = PAIRS.map((_, i) => i);
+  for (let i = deal.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [deal[i], deal[j]] = [deal[j], deal[i]];
+  }
+  const beads = Array.from({ length: 12 }, (_, i) => {
+    const [fill, stroke] = PAIRS[deal[i]];
+    const home = (i * TAU) / 12;
+    return { i, label: String(i === 0 ? 12 : i), fill, stroke, lab: hexToLab(fill), home, th: home, prev: home, om: 0, w: 28, drag: null };
+  });
+  const gapMin = new Array(12).fill(0.12);
+
+  // Text metrics: centre each numeral's line box on the ring, exactly like the Figma text frames.
+  let baseY = 25, glyphMid = -2, glyphHalf = 27, fontReady = false;
+  function measure() {
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.font = `${FONT_PX}px ${FACE}`;
+    const m = ctx.measureText('0');
+    const asc = m.fontBoundingBoxAscent ?? FONT_PX * 0.9;
+    const desc = m.fontBoundingBoxDescent ?? FONT_PX * 0.3;
+    baseY = -(asc + desc) / 2 + asc;
+    const cap = ctx.measureText('1').actualBoundingBoxAscent || FONT_PX * 0.75;
+    glyphHalf = cap / 2;
+    glyphMid = baseY - cap / 2;
+    for (const b of beads) b.w = ctx.measureText(b.label).width;
+    ctx.restore();
+    for (let k = 0; k < 12; k++) {
+      const a = beads[k], b = beads[(k + 1) % 12];
+      gapMin[k] = (((a.w + b.w) / 2 + STROKE * 2) * OVERLAP) / R_RING;
+    }
+  }
+
+  // ---- Canvas sizing ----
+  let W = 0, H = 0, dpr = 1, S = 1;
+  function resize() {
+    const r = cv.getBoundingClientRect();
+    W = r.width; H = r.height;
+    dpr = Math.min(window.devicePixelRatio || 1, 3);
+    cv.width = Math.round(W * dpr);
+    cv.height = Math.round(H * dpr);
+    S = Math.min(W, H) / EXTENT;
+  }
+
+  // ---- Gravity: straight down until the phone reports its tilt ----
+  let mode = 'orbit';               // 'orbit' = held on the hours, 'fall' = free on the ring
+  const grav = { x: 0, y: 1 };
+  let gravTarget = { x: 0, y: 1 };
+  let sensorLive = false, listening = false, askedMotion = false;
+
+  function onOrient(e) {
+    if (e.beta == null || e.gamma == null) return;
+    sensorLive = true;
+    const b = (e.beta * Math.PI) / 180, g = (e.gamma * Math.PI) / 180;
+    // Gravity projected onto the screen plane, in device-portrait screen coords (x right, y down)
+    const x = Math.sin(g) * Math.cos(b), y = Math.sin(b);
+    const turn = (screen.orientation && typeof screen.orientation.angle === 'number')
+      ? screen.orientation.angle
+      : (typeof window.orientation === 'number' ? window.orientation : 0);
+    const a = (-turn * Math.PI) / 180;
+    gravTarget = { x: x * Math.cos(a) - y * Math.sin(a), y: x * Math.sin(a) + y * Math.cos(a) };
+  }
+  function listen() {
+    if (listening) return;
+    listening = true;
+    window.addEventListener('deviceorientation', onOrient);
+  }
+  function askMotion() {
+    if (askedMotion) return;
+    askedMotion = true;
+    const D = window.DeviceOrientationEvent;
+    if (D && typeof D.requestPermission === 'function') {
+      // iOS: must be asked from inside a tap
+      D.requestPermission().then(s => { if (s === 'granted') listen(); }).catch(() => {});
+    } else {
+      listen();
+    }
+  }
+  if (!(window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function')) listen();
+
+  function toggle() {
+    askMotion();
+    if (mode === 'orbit') {
+      mode = 'fall';
+      for (const b of beads) if (!b.drag) b.om += (Math.random() - 0.5) * 0.4;
+    } else {
+      mode = 'orbit';
+    }
+  }
+
+  // ---- Simulation ----
+  function gapAt(k) {
+    const a = beads[k].th, b = k === 11 ? beads[0].th + TAU : beads[k + 1].th;
+    return Math.max(0, b - a);
+  }
+  function solve(k) {
+    const a = beads[k], b = beads[(k + 1) % 12];
+    const gap = b.th + (k === 11 ? TAU : 0) - a.th, need = gapMin[k];
+    if (gap >= need) return;
+    const wa = a.drag ? 0 : 1, wb = b.drag ? 0 : 1, ws = wa + wb;
+    if (!ws) return;
+    const c = need - gap;
+    a.th -= (c * wa) / ws;
+    b.th += (c * wb) / ws;
+  }
+  function step(dt) {
+    let lap = 0;
+    if (mode === 'orbit') {
+      // One shared lap offset keeps every bead heading home the same way round, so none get wedged.
+      let sum = 0;
+      for (const b of beads) sum += b.th - b.home;
+      lap = TAU * Math.round(sum / 12 / TAU);
+    }
+    for (const b of beads) {
+      b.prev = b.th;
+      if (b.drag) {
+        const d = b.drag.target - b.th;
+        b.th += Math.max(-MAX_FOLLOW, Math.min(MAX_FOLLOW, d));
+        continue;
+      }
+      const acc = mode === 'fall'
+        ? (G * (grav.x * Math.cos(b.th) + grav.y * Math.sin(b.th))) / R_RING - FALL_DAMP * b.om
+        : -K_HOME * (b.th - b.home - lap) - HOME_DAMP * b.om;
+      b.om += acc * dt;
+      b.th += b.om * dt;
+    }
+    for (let it = 0; it < ITER; it++) {
+      for (let k = 0; k < 12; k++) solve(k);
+      for (let k = 11; k >= 0; k--) solve(k);
+    }
+    const ease = 1 - Math.exp(-dt / 0.06);
+    for (const b of beads) {
+      const v = (b.th - b.prev) / dt;
+      if (b.drag) b.drag.vel += (v - b.drag.vel) * ease;
+      else b.om = v;
+    }
+  }
+  function rebase() {
+    const shift = TAU * Math.floor(beads[0].th / TAU);
+    if (!shift) return;
+    for (const b of beads) {
+      b.th -= shift; b.prev -= shift;
+      if (b.drag) b.drag.target -= shift;
+    }
+  }
+
+  // Paint order: start just after the widest gap so the pile shingles one way.
+  function drawList() {
+    let kMax = 0, gMax = -1;
+    for (let k = 0; k < 12; k++) {
+      const g = gapAt(k);
+      if (g > gMax) { gMax = g; kMax = k; }
+    }
+    const list = [], lifted = [];
+    for (let n = 1; n <= 12; n++) {
+      const b = beads[(kMax + n) % 12];
+      (b.drag ? lifted : list).push(b);
+    }
+    return list.concat(lifted);
+  }
+
+  // A hand reads its value against wherever the numerals are right now.
+  function handAt(u) {
+    const base = Math.floor(u), f = u - base, k = ((base % 12) + 12) % 12, n = (k + 1) % 12;
+    return { ang: beads[k].th + f * gapAt(k), color: mixLab(beads[k].lab, beads[n].lab, f) };
+  }
+
+  // ---- Drawing ----
+  function drawHand(h, spec) {
+    const s = Math.sin(h.ang), c = Math.cos(h.ang);
+    ctx.strokeStyle = h.color;
+    ctx.lineWidth = spec.w;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(-s * spec.tail, c * spec.tail);
+    ctx.lineTo(s * spec.len, -c * spec.len);
+    ctx.stroke();
+  }
+  function dot(color, r) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, TAU);
+    ctx.fill();
+  }
+  let lastLabel = '';
+  function render() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    ctx.translate(W / 2, H / 2);
+    ctx.scale(S, S);
+
+    ctx.fillStyle = DIAL;
+    ctx.beginPath();
+    ctx.arc(0, 0, R_DIAL, 0, TAU);
+    ctx.fill();
+
+    if (fontReady) {
+      ctx.font = `${FONT_PX}px ${FACE}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'alphabetic';
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = STROKE * 2;   // stroke drawn first, fill on top = 2 px outside stroke
+      for (const b of drawList()) {
+        ctx.save();
+        ctx.rotate(b.th);
+        ctx.translate(0, -R_RING);
+        ctx.strokeStyle = b.stroke;
+        ctx.strokeText(b.label, 0, baseY);
+        ctx.fillStyle = b.fill;
+        ctx.fillText(b.label, 0, baseY);
+        ctx.restore();
+      }
+    }
+
+    const d = new Date();
+    const sec = d.getSeconds() + d.getMilliseconds() / 1000;
+    const min = d.getMinutes() + sec / 60;
+    const hr = (d.getHours() % 12) + min / 60;
+    const hH = handAt(hr), hM = handAt(min / 5), hS = handAt(sec / 5);
+    dot(hH.color, HAND.hour.dot);
+    drawHand(hH, HAND.hour);
+    drawHand(hM, HAND.minute);
+    dot(hM.color, HAND.minute.dot);
+    dot(hS.color, HAND.second.dot);
+    drawHand(hS, HAND.second);
+
+    const t = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+    if (t !== lastLabel) {
+      lastLabel = t;
+      cv.setAttribute('aria-label', `時鐘，現在 ${t}。點一下讓數字落下，再點一下回到原位；數字可以沿著圓拖曳。`);
+    }
+  }
+
+  let last = 0, acc = 0;
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    const e = 1 - Math.exp(-dt / 0.08);
+    grav.x += (gravTarget.x - grav.x) * e;
+    grav.y += (gravTarget.y - grav.y) * e;
+    acc += dt;
+    while (acc >= STEP) { step(STEP); acc -= STEP; }
+    rebase();
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- Input: drag along the ring, tap anywhere to drop / restore ----
+  function toDesign(e) {
+    const r = cv.getBoundingClientRect();
+    return { x: (e.clientX - r.left - W / 2) / S, y: (e.clientY - r.top - H / 2) / S };
+  }
+  function hit(p) {
+    const list = drawList();
+    for (let n = list.length - 1; n >= 0; n--) {
+      const b = list[n];
+      if (b.drag) continue;
+      const s = Math.sin(b.th), c = Math.cos(b.th);
+      const vx = p.x - R_RING * s, vy = p.y + R_RING * c;
+      const lx = vx * c + vy * s, ly = -vx * s + vy * c;
+      if (Math.abs(lx) <= b.w / 2 + 10 && Math.abs(ly - glyphMid) <= glyphHalf + 12) return b;
+    }
+    return null;
+  }
+  const pointers = new Map();
+  cv.addEventListener('pointerdown', e => {
+    if (e.button !== undefined && e.button > 0) return;
+    try { cv.setPointerCapture(e.pointerId); } catch (_) {}
+    const p = toDesign(e);
+    const b = fontReady ? hit(p) : null;
+    const rec = { x0: e.clientX, y0: e.clientY, t0: performance.now(), moved: false, bead: b };
+    if (b) {
+      b.drag = { target: b.th, lastA: Math.atan2(p.x, -p.y), vel: 0 };
+      cv.classList.add('dragging');
+    }
+    pointers.set(e.pointerId, rec);
+  });
+  cv.addEventListener('pointermove', e => {
+    const rec = pointers.get(e.pointerId);
+    if (!rec) {
+      if (e.pointerType === 'mouse') cv.style.cursor = fontReady && hit(toDesign(e)) ? 'grab' : 'pointer';
+      return;
+    }
+    if (Math.hypot(e.clientX - rec.x0, e.clientY - rec.y0) > 8) rec.moved = true;
+    const b = rec.bead;
+    if (!b || !b.drag) return;
+    const p = toDesign(e);
+    if (Math.hypot(p.x, p.y) < 16) return;   // angle is meaningless right at the pivot
+    const a = Math.atan2(p.x, -p.y);
+    let d = a - b.drag.lastA;
+    d -= TAU * Math.round(d / TAU);
+    b.drag.target += d;
+    b.drag.lastA = a;
+  });
+  function release(e, cancelled) {
+    const rec = pointers.get(e.pointerId);
+    if (!rec) return;
+    pointers.delete(e.pointerId);
+    const b = rec.bead;
+    if (b && b.drag) {
+      b.om = rec.moved ? Math.max(-MAX_FLING, Math.min(MAX_FLING, b.drag.vel)) : 0;
+      b.drag = null;
+    }
+    let anyDrag = false;
+    for (const r of pointers.values()) if (r.bead) anyDrag = true;
+    if (!anyDrag) cv.classList.remove('dragging');
+    if (!cancelled && !rec.moved && performance.now() - rec.t0 < 450) toggle();
+  }
+  cv.addEventListener('pointerup', e => release(e, false));
+  cv.addEventListener('pointercancel', e => release(e, true));
+  cv.addEventListener('contextmenu', e => e.preventDefault());
+
+  // Keyboard: Space/Enter drops or restores; arrows tilt gravity where there is no motion sensor.
+  window.addEventListener('keydown', e => {
+    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggle(); return; }
+    const dirs = { ArrowDown: [0, 1], ArrowUp: [0, -1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] };
+    const dir = dirs[e.key];
+    if (dir && !sensorLive) {
+      e.preventDefault();
+      gravTarget = { x: dir[0], y: dir[1] };
+      if (mode === 'orbit') toggle();
+    }
+  });
+
+  window.addEventListener('resize', resize);
+  resize();
+  measure();
+
+  const ready = () => { if (!fontReady) { measure(); fontReady = true; } };
+  if (document.fonts && document.fonts.load) {
+    document.fonts.load(`${FONT_PX}px "League Gothic"`).then(ready, ready);
+    setTimeout(ready, 1500);   // never leave the dial bare if the font host is slow
+  } else {
+    ready();
+  }
+
+  requestAnimationFrame(t => { last = t; requestAnimationFrame(frame); });
+})();
+</script>
+</body>
+</html>
